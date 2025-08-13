@@ -1,12 +1,14 @@
 name: record-linkage
 channels:
   - conda-forge
-dependencies: # Check compatibility for Windows/Linux/MacOS (no arch version)
-  - python=3.11
+dependencies:
+  - python=3.10
   - ipykernel=6.30
+  - ipywidgets=8.1
   - matplotlib=3.10
-  - numpy=1.24
-  - pip=23.2
-  - pip:
-    - linktransformer
   - pandas=2.2
+  - pip=25.2
+  - setuptools>=70.0.0
+  - wheel>=0.44.0
+  - pip:
+      - linktransformer
