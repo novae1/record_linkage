@@ -1,5 +1,7 @@
 name: record-linkage
 channels:
+  - pytorch
+  - nvidia
   - conda-forge
 dependencies:
   - python=3.10
@@ -10,5 +12,18 @@ dependencies:
   - pip=25.2
   - setuptools>=70.0.0
   - wheel>=0.44.0
-  - pip:
-      - linktransformer
+  
+  # new dependencies
+  - numpy=1.26
+  - scikit-learn=1.5
+  - pytorch=2.3.1
+  - seaborn=0.13
+
+  # Only install if computer has nvidia GPU
+  #- pytorch-cuda=12.1
+  
+  # hugging face ecosystem
+  - transformers=4.42.3
+  - datasets=2.20.0
+  - accelerate=0.32.1
+  - evaluate=0.4.2
