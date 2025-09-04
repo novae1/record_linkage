@@ -22,9 +22,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import pandas as pd
 
 
-# Default absolute path to the NCVR CSV files in this workspace
-DEFAULT_DATA_DIR = \
-    "/home/nicolas/Documents/record_linkage/data/north_carolina_voters"
+# Default path to the NCVR CSV files, relative to the project root.
+# Resolved from this file's directory: ../data/north_carolina_voters
+DEFAULT_DATA_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "data", "north_carolina_voters")
+)
 
 
 def normalize_recid(recid: Union[str, int, float, None]) -> Optional[str]:

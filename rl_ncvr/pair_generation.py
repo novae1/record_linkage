@@ -14,25 +14,25 @@ Output example line:
     ["[FIELD] givenname [VALUE] John [FIELD] surname [VALUE] Smith ...",
      "[FIELD] givenname [VALUE] Jon [FIELD] surname [VALUE] Smyth ..."]
 
-CLI usage:
+CLI usage (run from project root):
     python -m rl_ncvr.pair_generation \
         --box_id 0 \
-        --output "/home/nicolas/Documents/record_linkage/rl_ncvr/outputs/box0_positive_pairs.json.gz" \
-        --data_dir "/home/nicolas/Documents/record_linkage/data/north_carolina_voters"
+        --output "rl_ncvr/outputs/box0_positive_pairs.json.gz" \
+        --data_dir "data/north_carolina_voters"
 
 Training script config (example data_config.json):
     [
       {"name": "box0_positive_pairs.json.gz", "weight": 1}
     ]
 
-Launch training (example):
+Launch training (example, run from project root):
     python rl_ncvr/train_script.py \
         --model nreimers/MiniLM-L6-H384-uncased \
         --steps 2000 \
         --batch_size 64 \
-        --data_folder "/home/nicolas/Documents/record_linkage/rl_ncvr/outputs" \
-        "/home/nicolas/Documents/record_linkage/rl_ncvr/outputs/data_config.json" \
-        "/home/nicolas/Documents/record_linkage/outputs/your_experiment_folder"
+        --data_folder "rl_ncvr/outputs" \
+        "rl_ncvr/outputs/data_config.json" \
+        "outputs/your_experiment_folder"
 """
 
 from __future__ import annotations
