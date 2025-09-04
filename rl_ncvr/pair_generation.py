@@ -46,7 +46,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from rl_ncvr.box_splitting import get_box, DEFAULT_DATA_DIR
+from box_splitting import get_box, DEFAULT_DATA_DIR
 
 
 def _try_detect_marker_words(model_name: Optional[str] = None) -> Tuple[str, str]:

@@ -16,6 +16,7 @@ Metrics:
 from __future__ import annotations
 
 import math
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -24,8 +25,8 @@ import pandas as pd
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from rl_ncvr.box_splitting import get_box, DEFAULT_DATA_DIR
-from rl_ncvr.pair_generation import _try_detect_marker_words, _serialize_row
+from box_splitting import get_box, DEFAULT_DATA_DIR
+from pair_generation import _try_detect_marker_words, _serialize_row
 
 
 @dataclass
@@ -39,11 +40,23 @@ class EvalParams:
     batch_size: int = 2048
     candidate_chunk_size: int = 200_000
     ks: Sequence[int] = (1, 10, 50)
+    verbose: bool = True
+    log_every_batches: int = 50
+    # New CPU-friendly controls
+    max_queries_per_source: Optional[int] = None
+    max_candidates_per_source: Optional[int] = None
+    shard_modulus: Optional[int] = None
+    shard_remainder: Optional[int] = None
+    sources_to_eval: Optional[Sequence[str]] = None
+    seed: int = 42
+    max_length: int = 128
 
 
 def _serialize_parts_for_box(
     params: EvalParams,
 ) -> Dict[str, pd.DataFrame]:
+    if params.verbose:
+        print(f"[eval] Loading and serializing box={params.box_id} from {params.data_dir or DEFAULT_DATA_DIR}...")
     parts = get_box(
         params.box_id,
         data_dir=params.data_dir or DEFAULT_DATA_DIR,
@@ -54,6 +67,8 @@ def _serialize_parts_for_box(
     result: Dict[str, pd.DataFrame] = {}
     for src, df in parts.items():
         if df.empty:
+            if params.verbose:
+                print(f"[eval] Source {src}: 0 rows")
             result[src] = df
             continue
         cols_to_keep = [params.recid_column, *params.entity_columns]
@@ -61,6 +76,18 @@ def _serialize_parts_for_box(
         if missing:
             raise KeyError(f"Missing expected columns in {src}: {missing}")
         view = df[cols_to_keep].copy()
+        # Optional virtual micro-shard filtering by recid
+        if params.shard_modulus is not None:
+            if params.verbose:
+                print(f"[eval]  -> Applying shard filter: recid % {params.shard_modulus} == {params.shard_remainder}")
+            # Stable 64-bit hash via SHA-256 (first 8 bytes)
+            recids = view[params.recid_column].astype(str).values
+            def sha256_uint64(s: str) -> int:
+                d = hashlib.sha256(s.encode('utf-8')).digest()
+                return int.from_bytes(d[:8], byteorder='big', signed=False)
+            h = np.fromiter((sha256_uint64(s) for s in recids), dtype=np.uint64, count=len(recids))
+            mask = (h % params.shard_modulus) == (params.shard_remainder or 0)
+            view = view.loc[mask].reset_index(drop=True)
         view["text"] = view.apply(
             lambda row: _serialize_row(
                 row,
@@ -71,6 +98,8 @@ def _serialize_parts_for_box(
             axis=1,
         )
         result[src] = view[[params.recid_column, "text"]]
+        if params.verbose:
+            print(f"[eval] Source {src}: {len(result[src]):,} rows serialized")
     return result
 
 
@@ -81,18 +110,20 @@ def _load_model_and_tokenizer(model_name_or_path: str, device: Optional[str] = N
         device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
+    print(f"[eval] Loaded model '{model_name_or_path}' on device={device}")
     return model, tokenizer, device
 
 
 @torch.no_grad()
-def _encode_texts(texts: List[str], model, tokenizer, device: str, batch_size: int) -> np.ndarray:
+def _encode_texts(texts: List[str], model, tokenizer, device: str, batch_size: int, max_length: int) -> np.ndarray:
     embs: List[np.ndarray] = []
-    for i in range(0, len(texts), batch_size):
+    total = len(texts)
+    for i in range(0, total, batch_size):
         batch = texts[i:i + batch_size]
         enc = tokenizer(
             batch,
             return_tensors="pt",
-            max_length=128,
+            max_length=max_length,
             truncation=True,
             padding="max_length",
         )
@@ -103,6 +134,11 @@ def _encode_texts(texts: List[str], model, tokenizer, device: str, batch_size: i
         pooled = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
         pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
         embs.append(pooled.detach().cpu().numpy())
+        # Lightweight progress every ~50 batches
+        if batch_size > 0:
+            bidx = i // batch_size
+            if bidx % 50 == 0 and bidx > 0:
+                print(f"[eval] Encoded {min(i + batch_size, total):,}/{total:,} texts...")
     return np.concatenate(embs, axis=0) if embs else np.zeros((0, 384), dtype=np.float32)
 
 
@@ -212,41 +248,83 @@ def evaluate_box(params: EvalParams) -> Dict[str, float]:
 
     # Aggregate metrics across sources
     all_metrics: List[Dict[str, float]] = []
-    sources = list(parts.keys())
+    sources_all = list(parts.keys())
+    sources = list(params.sources_to_eval) if params.sources_to_eval else sources_all
+    if params.verbose:
+        total_rows = {s: len(parts[s]) for s in sources}
+        print(f"[eval] Sources (selected): {sources}")
+        print(f"[eval] Row counts per source (selected): {total_rows}")
     for query_src in sources:
         # Query set
         q_df = parts[query_src]
         if q_df.empty:
+            if params.verbose:
+                print(f"[eval] Skip source {query_src}: no queries")
             continue
         q_recids = q_df[params.recid_column].astype(str).values
         q_texts = q_df["text"].tolist()
-        q_embs = _encode_texts(q_texts, model, tokenizer, device, params.batch_size)
+        if params.verbose:
+            print(f"[eval] Encoding queries from {query_src}: {len(q_texts):,} rows...")
+        # Optional cap on queries for speed
+        if params.max_queries_per_source is not None:
+            np.random.seed(params.seed)
+            if len(q_texts) > params.max_queries_per_source:
+                idx = np.random.choice(len(q_texts), size=params.max_queries_per_source, replace=False)
+                q_texts = [q_texts[i] for i in idx]
+                q_recids = q_recids[idx]
+                if params.verbose:
+                    print(f"[eval]  -> Sampled queries down to {len(q_texts):,}")
+        q_embs = _encode_texts(q_texts, model, tokenizer, device, params.batch_size, params.max_length)
 
         # Candidate pool = all other sources
         cand_dfs = [parts[s] for s in sources if s != query_src and not parts[s].empty]
         if not cand_dfs:
+            if params.verbose:
+                print(f"[eval] Skip candidates for {query_src}: no other sources")
             continue
         cand_all = pd.concat(cand_dfs, ignore_index=True)
         cand_recids_all = cand_all[params.recid_column].astype(str).values
         cand_texts_all = cand_all["text"].tolist()
+        # Optional cap on candidates for speed
+        if params.max_candidates_per_source is not None and len(cand_texts_all) > params.max_candidates_per_source:
+            np.random.seed(params.seed)
+            idx = np.random.choice(len(cand_texts_all), size=params.max_candidates_per_source, replace=False)
+            cand_texts_all = [cand_texts_all[i] for i in idx]
+            cand_recids_all = cand_recids_all[idx]
+            if params.verbose:
+                print(f"[eval]  -> Sampled candidates down to {len(cand_texts_all):,}")
+        if params.verbose:
+            total_c = len(cand_texts_all)
+            shards = math.ceil(total_c / params.candidate_chunk_size)
+            print(f"[eval] Candidates for {query_src}: {total_c:,} rows across {shards} shard(s) of up to {params.candidate_chunk_size:,}.")
 
         # Iterate candidate shards
         def shard_iter() -> Iterable[Tuple[np.ndarray, np.ndarray]]:
-            for i in range(0, len(cand_texts_all), params.candidate_chunk_size):
+            total = len(cand_texts_all)
+            shards = math.ceil(total / params.candidate_chunk_size)
+            for si, i in enumerate(range(0, total, params.candidate_chunk_size), start=1):
                 texts_chunk = cand_texts_all[i:i + params.candidate_chunk_size]
                 recids_chunk = cand_recids_all[i:i + params.candidate_chunk_size]
-                embs_chunk = _encode_texts(texts_chunk, model, tokenizer, device, params.batch_size)
+                if params.verbose:
+                    print(f"[eval]  -> Encoding candidate shard {si}/{shards} (size {len(texts_chunk):,})...")
+                embs_chunk = _encode_texts(texts_chunk, model, tokenizer, device, params.batch_size, params.max_length)
+                if params.verbose:
+                    print(f"[eval]  -> Encoded shard {si}/{shards}, merging top-K...")
                 yield embs_chunk.astype(np.float32, copy=False), recids_chunk
 
         top_scores_at_k, top_recids_at_k = _topk_across_shards(q_embs, shard_iter(), params.ks)
         metrics = _compute_metrics(q_recids, top_recids_at_k, top_scores_at_k, params.ks)
         all_metrics.append(metrics)
+        if params.verbose:
+            print(f"[eval] Metrics for {query_src}: {metrics}")
 
     # Aggregate by mean
     if not all_metrics:
         return {"recall@1": 0.0, "recall@10": 0.0, "recall@50": 0.0, "mrr@10": 0.0, "clf_best_f1": 0.0}
     keys = all_metrics[0].keys()
     agg = {k: float(np.mean([m[k] for m in all_metrics])) for k in keys}
+    if params.verbose:
+        print(f"[eval] Aggregated metrics across sources: {agg}")
     return agg
 
 
