@@ -51,6 +51,7 @@ class EvalParams:
     seed: int = 42
     max_length: int = 128
     compute_hard_metrics: bool = True
+    classify_top_k: int = 1
 
 
 def _serialize_parts_for_box(
@@ -383,6 +384,160 @@ def evaluate_box(params: EvalParams) -> Dict[str, float]:
         top_scores_at_k, top_recids_at_k, top_texts_at_k = _topk_across_shards(q_embs, shard_iter(), params.ks)
         q_texts_arr = np.array(q_texts, dtype=object)
         metrics = _compute_metrics(q_recids, top_recids_at_k, top_scores_at_k, q_texts_arr if params.compute_hard_metrics else None, top_texts_at_k if params.compute_hard_metrics else None, params.ks)
+
+        # Compute ground-truth availability for F1 classification
+        cand_recid_set = set(cand_recids_all.tolist())
+        gt_overall = np.array([r in cand_recid_set for r in q_recids])
+
+        gt_hard = None
+        recid_to_texts: Dict[str, set] = {}
+        if params.compute_hard_metrics:
+            for r, t in zip(cand_recids_all.tolist(), cand_texts_all.tolist()):
+                recid_to_texts.setdefault(r, set()).add(str(t))
+            gt_hard = np.array([
+                (r in recid_to_texts) and any(tt != qtxt for tt in recid_to_texts[r])
+                for r, qtxt in zip(q_recids, q_texts_arr)
+            ])
+            metrics["hard_coverage"] = float(np.mean(gt_hard))
+
+        # Prepare arrays for top-K classification
+        max_k = max(params.ks)
+        use_k = min(params.classify_top_k, max_k)
+        scores_full = top_scores_at_k[max_k][:, :use_k]
+        recids_full = top_recids_at_k[max_k][:, :use_k]
+        texts_full = top_texts_at_k[max_k][:, :use_k] if params.compute_hard_metrics else None
+
+        thresholds = np.unique(top_scores_at_k[1][:, 0])
+
+        def sweep(labels: np.ndarray, hard: bool, mask: Optional[np.ndarray] = None):
+            if mask is not None:
+                if mask.sum() == 0:
+                    return 0.0, 0.0, 0.0, 0.0
+                lbl = labels[mask]
+                sc = scores_full[mask]
+                rc = recids_full[mask]
+                tx = texts_full[mask] if (hard and texts_full is not None) else None
+                qtxt = q_texts_arr[mask] if (hard and texts_full is not None) else None
+                qrc = q_recids[mask]
+            else:
+                lbl = labels
+                sc = scores_full
+                rc = recids_full
+                tx = texts_full if hard else None
+                qtxt = q_texts_arr if hard else None
+                qrc = q_recids
+
+            best = (0.0, 0.0, 0.0, 0.0)
+            for thr in thresholds:
+                meets_thr = sc >= thr
+                match_recid = (rc == qrc[:, None])
+                if hard:
+                    qt = np.broadcast_to(qtxt[:, None], match_recid.shape)
+                    non_identical = (tx != qt)
+                    pred = np.any(match_recid & non_identical & meets_thr, axis=1)
+                else:
+                    pred = np.any(match_recid & meets_thr, axis=1)
+                tp = np.sum(pred & lbl)
+                fp = np.sum(pred & ~lbl)
+                fn = np.sum(~pred & lbl)
+                prec = tp / (tp + fp + 1e-9)
+                rec = tp / (tp + fn + 1e-9)
+                f1 = 2 * prec * rec / (prec + rec + 1e-9)
+                if f1 > best[0]:
+                    best = (f1, float(thr), float(prec), float(rec))
+            return best
+
+        # Overall F1 (overwrite with proper top-K classification)
+        f1_o, thr_o, prec_o, rec_o = sweep(gt_overall, hard=False)
+        metrics.update({
+            "clf_best_f1": float(f1_o),
+            "clf_best_threshold": float(thr_o),
+            "clf_precision_at_best_f1": float(prec_o),
+            "clf_recall_at_best_f1": float(rec_o),
+        })
+
+        # Hard F1 (conditional on existence of hard positives)
+        if params.compute_hard_metrics and gt_hard is not None and texts_full is not None:
+            mask = gt_hard
+            f1_hc, thr_hc, prec_hc, rec_hc = sweep(gt_hard, hard=True, mask=mask)
+            metrics.update({
+                "clf_best_f1_hard_cond": float(f1_hc),
+                "clf_best_threshold_hard_cond": float(thr_hc),
+                "clf_precision_at_best_f1_hard_cond": float(prec_hc),
+                "clf_recall_at_best_f1_hard_cond": float(rec_hc),
+            })
+            # Optional strict hard over all queries (may be bounded by coverage)
+            f1_hs, thr_hs, prec_hs, rec_hs = sweep(gt_hard, hard=True, mask=None)
+            metrics.update({
+                "clf_best_f1_hard_strict": float(f1_hs),
+                "clf_best_threshold_hard_strict": float(thr_hs),
+                "clf_precision_at_best_f1_hard_strict": float(prec_hs),
+                "clf_recall_at_best_f1_hard_strict": float(rec_hs),
+            })
+
+        # Recompute F1 metrics with proper ground-truth labels and configurable top-K classification
+        # Ground-truth overall: recid present among candidates
+        cand_recid_set = set(cand_recids_all.tolist())
+        gt_overall = np.array([r in cand_recid_set for r in q_recids])
+
+        # Ground-truth hard: recid present with at least one non-identical text
+        gt_hard = None
+        if params.compute_hard_metrics:
+            recid_to_texts: Dict[str, set] = {}
+            for r, t in zip(cand_recids_all.tolist(), cand_texts_all.tolist()):
+                recid_to_texts.setdefault(r, set()).add(str(t))
+            gt_hard = np.array([
+                (r in recid_to_texts) and any(tt != qtxt for tt in recid_to_texts[r])
+                for r, qtxt in zip(q_recids, q_texts_arr)
+            ])
+
+        max_k = max(params.ks)
+        use_k = min(params.classify_top_k, max_k)
+        scores_full = top_scores_at_k[max_k][:, :use_k]
+        recids_full = top_recids_at_k[max_k][:, :use_k]
+        texts_full = top_texts_at_k[max_k][:, :use_k] if (params.compute_hard_metrics and top_texts_at_k is not None) else None
+
+        thresholds = np.unique(top_scores_at_k[1][:, 0])
+
+        def sweep(labels: np.ndarray, hard: bool) -> Tuple[float, float, float, float]:
+            best = (0.0, 0.0, 0.0, 0.0)  # f1, thr, prec, rec
+            for thr in thresholds:
+                meets_thr = scores_full >= thr
+                match_recid = (recids_full == q_recids[:, None])
+                if hard:
+                    qt = np.broadcast_to(q_texts_arr[:, None], match_recid.shape)
+                    non_identical = (texts_full != qt)
+                    pred = np.any(match_recid & non_identical & meets_thr, axis=1)
+                else:
+                    pred = np.any(match_recid & meets_thr, axis=1)
+                tp = np.sum(pred & labels)
+                fp = np.sum(pred & ~labels)
+                fn = np.sum(~pred & labels)
+                prec = tp / (tp + fp + 1e-9)
+                rec = tp / (tp + fn + 1e-9)
+                f1 = 2 * prec * rec / (prec + rec + 1e-9)
+                if f1 > best[0]:
+                    best = (f1, float(thr), float(prec), float(rec))
+            return best
+
+        # Overall F1 overwrite
+        f1, thr, prec, rec = sweep(gt_overall, hard=False)
+        metrics.update({
+            "clf_best_f1": float(f1),
+            "clf_best_threshold": float(thr),
+            "clf_precision_at_best_f1": float(prec),
+            "clf_recall_at_best_f1": float(rec),
+        })
+
+        # Hard F1 overwrite
+        if gt_hard is not None and texts_full is not None:
+            f1h, thrh, prech, rech = sweep(gt_hard, hard=True)
+            metrics.update({
+                "clf_best_f1_hard": float(f1h),
+                "clf_best_threshold_hard": float(thrh),
+                "clf_precision_at_best_f1_hard": float(prech),
+                "clf_recall_at_best_f1_hard": float(rech),
+            })
         all_metrics.append(metrics)
         if params.verbose:
             print(f"[eval] Metrics for {query_src}: {metrics}")
