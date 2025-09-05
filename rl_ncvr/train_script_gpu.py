@@ -10,16 +10,28 @@ Usage (run from project root):
         --save_steps 10000 \
         --batch_size 64 \
         --max_length 128 \
-        --datasets_per_batch 2 \
         --scale 20 \
+        --log_every 50 \
         --data_folder rl_ncvr/outputs \
         rl_ncvr/outputs/data_config.json \
         outputs/run_minilm_box0_gpu
 
-data_config.json example:
-    [
-      {"name": "box0_positive_pairs.json.gz", "weight": 1}
-    ]
+Flags:
+    --model: HF model name/path (default: nreimers/MiniLM-L6-H384-uncased)
+    --steps: total training steps (batches)
+    --save_steps: save checkpoint every N steps (default: 10000)
+    --batch_size: samples per device step
+    --max_length: tokenizer max sequence length (truncation)
+    --scale: similarity scale (20 for cosine, 1 for unnormalized dot)
+    --log_every: print step+loss every N steps (0 disables)
+    --data_folder: directory containing .json.gz train files
+    data_config (positional): JSON list of {"name": filename, "weight": int}
+    output (positional): output directory for checkpoints
+
+Standard run (copy/paste):
+    python rl_ncvr/train_script_gpu.py --model nreimers/MiniLM-L6-H384-uncased \
+        --steps 2000 --batch_size 64 --max_length 128 --scale 20 --log_every 50 \
+        --data_folder rl_ncvr/outputs rl_ncvr/outputs/data_config.json outputs/run_minilm_box0_gpu
 """
 
 from __future__ import annotations
@@ -175,6 +187,7 @@ def main():
     parser.add_argument('--datasets_per_batch', type=int, default=2, help="Ignored on single GPU; kept for CLI parity")
     parser.add_argument('--scale', type=float, default=20, help="Use 20 for cossim, and 1 for unnormalized embeddings with dot product")
     parser.add_argument('--data_folder', default='rl_ncvr/outputs', help='Folder with your dataset files')
+    parser.add_argument('--log_every', type=int, default=0, help='Print step/loss every N steps (0 disables)')
     parser.add_argument('data_config', help='A data_config.json file')
     parser.add_argument('output')
     args = parser.parse_args()
@@ -234,6 +247,9 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
         lr_scheduler.step()
+
+        if args.log_every and ((global_step + 1) % args.log_every == 0):
+            print(f"step {global_step+1}/{args.steps} - loss {loss.item():.4f}")
 
         if (global_step + 1) % args.save_steps == 0:
             output_path = os.path.join(args.output, str(global_step + 1))
