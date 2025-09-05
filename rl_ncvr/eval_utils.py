@@ -50,6 +50,7 @@ class EvalParams:
     sources_to_eval: Optional[Sequence[str]] = None
     seed: int = 42
     max_length: int = 128
+    compute_hard_metrics: bool = True
 
 
 def _serialize_parts_for_box(
@@ -117,6 +118,15 @@ def _load_model_and_tokenizer(model_name_or_path: str, device: Optional[str] = N
 @torch.no_grad()
 def _encode_texts(texts: List[str], model, tokenizer, device: str, batch_size: int, max_length: int) -> np.ndarray:
     embs: List[np.ndarray] = []
+    # Coerce to a plain Python list of strings for the tokenizer
+    if isinstance(texts, np.ndarray):
+        texts = texts.tolist()
+    else:
+        try:
+            texts = list(texts)
+        except TypeError:
+            texts = [texts]
+    texts = [str(t) for t in texts]
     total = len(texts)
     for i in range(0, total, batch_size):
         batch = texts[i:i + batch_size]
@@ -144,9 +154,9 @@ def _encode_texts(texts: List[str], model, tokenizer, device: str, batch_size: i
 
 def _topk_across_shards(
     query_embs: np.ndarray,
-    candidate_iter: Iterable[Tuple[np.ndarray, np.ndarray]],  # yields (cand_embs, cand_recids)
+    candidate_iter: Iterable[Tuple[np.ndarray, np.ndarray, np.ndarray]],  # (cand_embs, cand_recids, cand_texts)
     ks: Sequence[int],
-) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
+) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[int, np.ndarray]]:
     """
     Maintain top-K hits per query across multiple candidate shards.
     Returns dicts: top_scores[k] -> (Q, k), top_recids[k] -> (Q, k)
@@ -156,12 +166,14 @@ def _topk_across_shards(
     # Initialize with very low scores and empty recids
     top_scores = {k: np.full((Q, k), -np.inf, dtype=np.float32) for k in ks}
     top_recids = {k: np.empty((Q, k), dtype=object) for k in ks}
+    top_texts = {k: np.empty((Q, k), dtype=object) for k in ks}
 
     # We'll maintain for max_k, then slice for each K
     cur_scores = np.full((Q, max_k), -np.inf, dtype=np.float32)
     cur_recids = np.empty((Q, max_k), dtype=object)
+    cur_texts = np.empty((Q, max_k), dtype=object)
 
-    for cand_embs, cand_recids in candidate_iter:
+    for cand_embs, cand_recids, cand_texts in candidate_iter:
         # Compute similarities (cosine = dot because unit-normalized)
         sims = np.matmul(query_embs, cand_embs.T)  # (Q, C)
         # For each query, merge candidates into existing top list
@@ -169,27 +181,33 @@ def _topk_across_shards(
         # Combine current top and new sims
         combined_scores = np.concatenate([cur_scores, sims], axis=1)  # (Q, max_k + C)
         combined_recids = np.concatenate([cur_recids, np.broadcast_to(cand_recids, (Q, cand_recids.shape[0]))], axis=1)
+        combined_texts = np.concatenate([cur_texts, np.broadcast_to(cand_texts, (Q, cand_texts.shape[0]))], axis=1)
         # Argsort descending
         idx = np.argpartition(combined_scores, -max_k, axis=1)[:, -max_k:]
         # Gather top candidates
         row_idx = np.arange(Q)[:, None]
         top_s = combined_scores[row_idx, idx]
         top_r = combined_recids[row_idx, idx]
+        top_t = combined_texts[row_idx, idx]
         # Now sort each row descending fully
         order = np.argsort(-top_s, axis=1)
         cur_scores = np.take_along_axis(top_s, order, axis=1)
         cur_recids = np.take_along_axis(top_r, order, axis=1)
+        cur_texts = np.take_along_axis(top_t, order, axis=1)
 
     for k in ks:
         top_scores[k] = cur_scores[:, :k]
         top_recids[k] = cur_recids[:, :k]
-    return top_scores, top_recids
+        top_texts[k] = cur_texts[:, :k]
+    return top_scores, top_recids, top_texts
 
 
 def _compute_metrics(
     query_recids: np.ndarray,
     top_recids_at_k: Dict[int, np.ndarray],
     top_scores_at_k: Dict[int, np.ndarray],
+    query_texts: Optional[np.ndarray],
+    top_texts_at_k: Optional[Dict[int, np.ndarray]],
     ks: Sequence[int],
 ) -> Dict[str, float]:
     metrics: Dict[str, float] = {}
@@ -236,6 +254,55 @@ def _compute_metrics(
         "clf_precision_at_best_f1": float(best_prec),
         "clf_recall_at_best_f1": float(best_rec),
     })
+    # Hard metrics
+    if query_texts is not None and top_texts_at_k is not None:
+        for k in ks:
+            mask_same_recid = (top_recids_at_k[k] == query_recids[:, None])
+            qt = np.broadcast_to(query_texts[:, None], mask_same_recid.shape)
+            tt = top_texts_at_k[k]
+            mask_non_identical = mask_same_recid & (tt != qt)
+            hits_hard = np.any(mask_non_identical, axis=1)
+            metrics[f"recall@{k}_hard"] = float(np.mean(hits_hard))
+
+        ranks_hard = np.full(Q, np.inf)
+        top10_r = top_recids_at_k.get(10)
+        top10_t = top_texts_at_k.get(10)
+        if top10_r is not None and top10_t is not None:
+            qt10 = np.broadcast_to(query_texts[:, None], top10_r.shape)
+            for i in range(Q):
+                mask = (top10_r[i] == query_recids[i]) & (top10_t[i] != qt10[i])
+                match = np.where(mask)[0]
+                if match.size > 0:
+                    ranks_hard[i] = match[0] + 1
+            finite = ranks_hard[np.isfinite(ranks_hard)]
+            metrics["mrr@10_hard"] = float(np.mean(1.0 / finite)) if finite.size > 0 else 0.0
+        else:
+            metrics["mrr@10_hard"] = float('nan')
+
+        top1_texts = top_texts_at_k[1][:, 0]
+        labels_hard = (top1_recids == query_recids) & (top1_texts != query_texts)
+        thresholds = np.unique(top1_scores)
+        best_f1 = 0.0
+        best_thr = 0.0
+        best_prec = 0.0
+        best_rec = 0.0
+        for thr in thresholds:
+            preds = top1_scores >= thr
+            tp = np.sum(preds & labels_hard)
+            fp = np.sum(preds & ~labels_hard)
+            fn = np.sum(~preds & labels_hard)
+            prec = tp / (tp + fp + 1e-9)
+            rec = tp / (tp + fn + 1e-9)
+            f1 = 2 * prec * rec / (prec + rec + 1e-9)
+            if f1 > best_f1:
+                best_f1, best_thr, best_prec, best_rec = f1, thr, prec, rec
+        metrics.update({
+            "clf_best_f1_hard": float(best_f1),
+            "clf_best_threshold_hard": float(best_thr),
+            "clf_precision_at_best_f1_hard": float(best_prec),
+            "clf_recall_at_best_f1_hard": float(best_rec),
+        })
+
     return metrics
 
 
@@ -284,7 +351,7 @@ def evaluate_box(params: EvalParams) -> Dict[str, float]:
             continue
         cand_all = pd.concat(cand_dfs, ignore_index=True)
         cand_recids_all = cand_all[params.recid_column].astype(str).values
-        cand_texts_all = cand_all["text"].tolist()
+        cand_texts_all = cand_all["text"].astype(str).values
         # Optional cap on candidates for speed
         if params.max_candidates_per_source is not None and len(cand_texts_all) > params.max_candidates_per_source:
             np.random.seed(params.seed)
@@ -299,7 +366,7 @@ def evaluate_box(params: EvalParams) -> Dict[str, float]:
             print(f"[eval] Candidates for {query_src}: {total_c:,} rows across {shards} shard(s) of up to {params.candidate_chunk_size:,}.")
 
         # Iterate candidate shards
-        def shard_iter() -> Iterable[Tuple[np.ndarray, np.ndarray]]:
+        def shard_iter() -> Iterable[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
             total = len(cand_texts_all)
             shards = math.ceil(total / params.candidate_chunk_size)
             for si, i in enumerate(range(0, total, params.candidate_chunk_size), start=1):
@@ -307,13 +374,15 @@ def evaluate_box(params: EvalParams) -> Dict[str, float]:
                 recids_chunk = cand_recids_all[i:i + params.candidate_chunk_size]
                 if params.verbose:
                     print(f"[eval]  -> Encoding candidate shard {si}/{shards} (size {len(texts_chunk):,})...")
-                embs_chunk = _encode_texts(texts_chunk, model, tokenizer, device, params.batch_size, params.max_length)
+                # Pass a list[str] to the tokenizer while preserving numpy array for broadcasting elsewhere
+                embs_chunk = _encode_texts(texts_chunk.tolist(), model, tokenizer, device, params.batch_size, params.max_length)
                 if params.verbose:
                     print(f"[eval]  -> Encoded shard {si}/{shards}, merging top-K...")
-                yield embs_chunk.astype(np.float32, copy=False), recids_chunk
+                yield embs_chunk.astype(np.float32, copy=False), recids_chunk, texts_chunk
 
-        top_scores_at_k, top_recids_at_k = _topk_across_shards(q_embs, shard_iter(), params.ks)
-        metrics = _compute_metrics(q_recids, top_recids_at_k, top_scores_at_k, params.ks)
+        top_scores_at_k, top_recids_at_k, top_texts_at_k = _topk_across_shards(q_embs, shard_iter(), params.ks)
+        q_texts_arr = np.array(q_texts, dtype=object)
+        metrics = _compute_metrics(q_recids, top_recids_at_k, top_scores_at_k, q_texts_arr if params.compute_hard_metrics else None, top_texts_at_k if params.compute_hard_metrics else None, params.ks)
         all_metrics.append(metrics)
         if params.verbose:
             print(f"[eval] Metrics for {query_src}: {metrics}")
