@@ -29,9 +29,9 @@ Flags:
     output (positional): output directory for checkpoints
 
 Standard run (copy/paste):
-    python rl_ncvr/train_script_gpu.py --model nreimers/MiniLM-L6-H384-uncased \
+    python train_script_gpu.py --model nreimers/MiniLM-L6-H384-uncased \
         --steps 2000 --batch_size 64 --max_length 128 --scale 20 --log_every 50 \
-        --data_folder rl_ncvr/outputs rl_ncvr/outputs/data_config.json outputs/run_minilm_box0_gpu
+        --data_folder outputs outputs/data_config.json outputs/run_minilm_box0_gpu
 """
 
 from __future__ import annotations
