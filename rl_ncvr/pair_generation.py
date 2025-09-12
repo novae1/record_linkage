@@ -9,6 +9,8 @@ Constraints implemented per user requirements:
 - Drop entities that yield no distinct pairs (implicitly, by yielding none)
 - Serialize rows to a single string using markers derived from common vocab
 - Drop identical pairs (keep only pairs where serialized strings differ)
+ - Drop identical pairs (keep only pairs where serialized strings differ)
+ - Globally shuffle output lines to de-cluster pairs from the same entity
 
 Output example line:
     ["[FIELD] givenname [VALUE] John [FIELD] surname [VALUE] Smith ...",
@@ -41,6 +43,7 @@ import argparse
 import gzip
 import json
 import os
+import random
 from itertools import combinations
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -135,6 +138,13 @@ def generate_positive_pairs_for_box(
     """
     Build positive pairs for the specified box and write them to a .json.gz file.
 
+    Behavior:
+    - For each entity (`recid` group), serialize selected columns and emit all
+      pairwise combinations where the two serialized strings differ.
+    - Accumulate all pairs across entities in-memory, then globally shuffle the
+      list before writing a line-delimited JSON gzip file. This reduces the
+      chance that multiple pairs from the same entity appear near one another.
+
     Returns the absolute path to the written output file.
     """
     if data_dir is None:
@@ -177,25 +187,32 @@ def generate_positive_pairs_for_box(
 
     all_rows = pd.concat(trimmed_parts, ignore_index=True)
 
-    # Group by recid and stream-write pairs
+    # Group by recid, collect pairs, then shuffle globally before writing
     total_pairs = 0
     total_entities = 0
     total_entities_with_pairs = 0
+    buffered_pairs: List[Tuple[str, str]] = []
+    for _recid_value, group in all_rows.groupby(recid_column, sort=False):
+        total_entities += 1
+        emitted_here = 0
+        for a, b in _yield_pairs_for_entity(
+            group,
+            columns=entity_columns,
+            field_marker=field_marker,
+            value_marker=value_marker,
+        ):
+            buffered_pairs.append((a, b))
+            total_pairs += 1
+            emitted_here += 1
+        if emitted_here > 0:
+            total_entities_with_pairs += 1
+
+    # Shuffle globally to minimize locality of pairs from the same entity
+    random.shuffle(buffered_pairs)
+
     with gzip.open(output_path, "wt") as f_out:
-        for recid_value, group in all_rows.groupby(recid_column, sort=False):
-            total_entities += 1
-            emitted_here = 0
-            for a, b in _yield_pairs_for_entity(
-                group,
-                columns=entity_columns,
-                field_marker=field_marker,
-                value_marker=value_marker,
-            ):
-                f_out.write(json.dumps([a, b]) + "\n")
-                total_pairs += 1
-                emitted_here += 1
-            if emitted_here > 0:
-                total_entities_with_pairs += 1
+        for a, b in buffered_pairs:
+            f_out.write(json.dumps([a, b]) + "\n")
 
     print(
         f"Wrote {total_pairs:,} pairs from {total_entities:,} entities "
