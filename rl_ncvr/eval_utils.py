@@ -552,9 +552,160 @@ def evaluate_box(params: EvalParams) -> Dict[str, float]:
     return agg
 
 
+def evaluate_box_record_recall(
+    params: EvalParams,
+    ks: Sequence[int],
+) -> Dict[str, float]:
+    """
+    Compute record-level recall@K metrics tailored for blocking quality.
+
+    For each query record, let m be the total number of matching records in the
+    candidate pool (same recid). For a given K, let n be the number of matches
+    among the top-K retrieved candidates. The record-level recall@K is n / m.
+
+    We compute two variants:
+    - Easy: counts all matching records (including identical serialized texts)
+    - Hard: counts only non-identical matches (exclude candidates whose
+      serialized text equals the query's text) for both numerator and
+      denominator. Queries with m == 0 are excluded from the average.
+
+    The final metric is the mean of record-level scores across all queries with
+    at least one match in the candidate pool. Candidate pool follows current
+    behavior: for a given source, candidates are all other sources.
+
+    Parameters
+    ----------
+    params : EvalParams
+        Evaluation parameters controlling serialization, model, device, etc.
+    ks : Sequence[int]
+        List of K values for which to compute recall@K.
+
+    Returns
+    -------
+    Dict[str, float]
+        A mapping with keys like "record_recall@{k}_easy" and
+        "record_recall@{k}_hard" aggregated across sources (global average).
+    """
+    import numpy as np
+    import math
+
+    # Load serialized parts and model
+    parts = _serialize_parts_for_box(params)
+    model, tokenizer, device = _load_model_and_tokenizer(params.model_name_or_path, params.device)
+
+    # Prepare accumulators for all queries across sources
+    per_k_scores_easy: Dict[int, List[float]] = {int(k): [] for k in ks}
+    per_k_scores_hard: Dict[int, List[float]] = {int(k): [] for k in ks}
+
+    sources_all = list(parts.keys())
+    sources = list(params.sources_to_eval) if params.sources_to_eval else sources_all
+
+    for query_src in sources:
+        q_df = parts[query_src]
+        if q_df.empty:
+            continue
+
+        q_recids = q_df[params.recid_column].astype(str).values
+        q_texts = q_df["text"].astype(str).values
+
+        if params.verbose:
+            print(f"[eval-rr] Encoding queries from {query_src}: {len(q_texts):,} rows...")
+        q_embs = _encode_texts(list(q_texts), model, tokenizer, device, params.batch_size, params.max_length)
+
+        # Candidate pool = all other sources
+        cand_dfs = [parts[s] for s in sources if s != query_src and not parts[s].empty]
+        if not cand_dfs:
+            if params.verbose:
+                print(f"[eval-rr] Skip candidates for {query_src}: no other sources")
+            continue
+        cand_all = pd.concat(cand_dfs, ignore_index=True)
+        cand_recids_all = cand_all[params.recid_column].astype(str).values
+        cand_texts_all = cand_all["text"].astype(str).values
+
+        # Build denominator helpers
+        # Easy: total count of matching recid in candidates
+        # Hard: count of matching recid with text != query text
+        # Precompute recid -> total count, and recid -> map(text -> count)
+        recid_total: Dict[str, int] = {}
+        recid_text_counts: Dict[str, Dict[str, int]] = {}
+        for r, t in zip(cand_recids_all.tolist(), cand_texts_all.tolist()):
+            recid_total[r] = recid_total.get(r, 0) + 1
+            d = recid_text_counts.get(r)
+            if d is None:
+                d = {}
+                recid_text_counts[r] = d
+            d[t] = d.get(t, 0) + 1
+
+        # Retrieve top-K across shards
+        if params.verbose:
+            total_c = len(cand_texts_all)
+            shards = math.ceil(total_c / params.candidate_chunk_size)
+            print(f"[eval-rr] Candidates for {query_src}: {total_c:,} rows across {shards} shard(s) of up to {params.candidate_chunk_size:,}.")
+
+        def shard_iter():
+            total = len(cand_texts_all)
+            shards = math.ceil(total / params.candidate_chunk_size)
+            for si, i in enumerate(range(0, total, params.candidate_chunk_size), start=1):
+                texts_chunk = cand_texts_all[i:i + params.candidate_chunk_size]
+                recids_chunk = cand_recids_all[i:i + params.candidate_chunk_size]
+                if params.verbose:
+                    print(f"[eval-rr]  -> Encoding candidate shard {si}/{shards} (size {len(texts_chunk):,})...")
+                embs_chunk = _encode_texts(texts_chunk.tolist(), model, tokenizer, device, params.batch_size, params.max_length)
+                if params.verbose:
+                    print(f"[eval-rr]  -> Encoded shard {si}/{shards}, merging top-K...")
+                yield embs_chunk.astype(np.float32, copy=False), recids_chunk, texts_chunk
+
+        top_scores_at_k, top_recids_at_k, top_texts_at_k = _topk_across_shards(q_embs, shard_iter(), ks)
+
+        # Compute denominators for all queries (easy and hard)
+        m_easy = np.array([recid_total.get(r, 0) for r in q_recids], dtype=np.int32)
+        # For hard, exclude candidate rows identical to the query's text
+        m_hard = np.array([
+            recid_total.get(r, 0) - (recid_text_counts.get(r, {}).get(qt, 0))
+            for r, qt in zip(q_recids, q_texts)
+        ], dtype=np.int32)
+
+        # Valid masks: queries with at least one true match in candidates
+        mask_easy = m_easy > 0
+        mask_hard = m_hard > 0
+
+        q_recids_col = q_recids[:, None]
+        q_texts_col = q_texts[:, None]
+
+        for k in ks:
+            trec = top_recids_at_k[int(k)]  # (Q, k)
+            ttxt = top_texts_at_k[int(k)]   # (Q, k)
+            # Easy numerator: count matches by recid among top-k
+            match_easy = (trec == q_recids_col)
+            n_easy = match_easy.sum(axis=1).astype(np.int32)
+            # Hard numerator: matches by recid but exclude identical texts
+            non_identical = (ttxt != q_texts_col)
+            match_hard = match_easy & non_identical
+            n_hard = match_hard.sum(axis=1).astype(np.int32)
+
+            # Record-level recall for eligible queries
+            rec_easy = (n_easy[mask_easy] / m_easy[mask_easy].astype(np.float32)) if mask_easy.any() else np.array([], dtype=np.float32)
+            rec_hard = (n_hard[mask_hard] / m_hard[mask_hard].astype(np.float32)) if mask_hard.any() else np.array([], dtype=np.float32)
+
+            per_k_scores_easy[int(k)].extend(rec_easy.tolist())
+            per_k_scores_hard[int(k)].extend(rec_hard.tolist())
+
+    # Aggregate globally across all sources
+    results: Dict[str, float] = {}
+    for k in ks:
+        arr_e = np.array(per_k_scores_easy[int(k)], dtype=np.float32)
+        arr_h = np.array(per_k_scores_hard[int(k)], dtype=np.float32)
+        results[f"record_recall@{int(k)}_easy"] = float(arr_e.mean()) if arr_e.size > 0 else 0.0
+        results[f"record_recall@{int(k)}_hard"] = float(arr_h.mean()) if arr_h.size > 0 else 0.0
+
+    if params.verbose:
+        print(f"[eval-rr] Aggregated record-level recall: {results}")
+    return results
+
 __all__ = [
     "EvalParams",
     "evaluate_box",
+    "evaluate_box_record_recall",
 ]
 
 
