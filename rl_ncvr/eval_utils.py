@@ -261,12 +261,13 @@ def _topk_across_shards(
     return top_scores, top_recids, top_texts
 
 
-def evaluate_box_record_recall(
+def _evaluate_box_metrics(
     params: EvalParams,
     ks: Sequence[int],
+    include_map: bool,
 ) -> Dict[str, float]:
     """
-    Compute record-level recall@K (easy, hard) for blocking quality.
+    Compute record-level metrics for NCVR blocking quality.
 
     For each query, let m be the total number of matching records in the
     candidate pool (same recid). For a K, let n be the number of matches among
@@ -278,8 +279,8 @@ def evaluate_box_record_recall(
 
     Queries with m == 0 are excluded from the average.
 
-    Returns a dict with keys like record_recall@{K}_easy and
-    record_recall@{K}_hard (global averages across sources).
+    Returns a dict with keys like record_recall@{K}_easy, record_recall@{K}_hard,
+    and map@{K} (when requested) as global averages across sources.
     """
     # Load serialized parts and model
     parts = _serialize_parts_for_box(params)
@@ -290,6 +291,9 @@ def evaluate_box_record_recall(
     # Prepare accumulators across all sources
     per_k_scores_easy: Dict[int, List[float]] = {int(k): [] for k in ks}
     per_k_scores_hard: Dict[int, List[float]] = {int(k): [] for k in ks}
+    per_k_ap: Optional[Dict[int, List[float]]] = (
+        {int(k): [] for k in ks} if include_map else None
+    )
 
     sources_all = list(parts.keys())
     sources = list(params.sources_to_eval) if params.sources_to_eval else sources_all
@@ -411,6 +415,23 @@ def evaluate_box_record_recall(
             per_k_scores_easy[int(k)].extend(rec_easy.tolist())
             per_k_scores_hard[int(k)].extend(rec_hard.tolist())
 
+            if include_map and per_k_ap is not None:
+                # Mean Average Precision@K (easy variant)
+                rel_easy = match_easy.astype(np.float32)
+                if rel_easy.shape[1] > 0:
+                    cum_rel = np.cumsum(rel_easy, axis=1)
+                    ranks = np.arange(1, int(k) + 1, dtype=np.float32)
+                    precision_at_rank = cum_rel / ranks
+                    ap_numerators = (precision_at_rank * rel_easy).sum(axis=1)
+                    denom = np.minimum(m_easy, int(k)).astype(np.float32)
+                    ap_easy = np.divide(
+                        ap_numerators,
+                        denom,
+                        out=np.zeros_like(ap_numerators, dtype=np.float32),
+                        where=denom > 0,
+                    )
+                    per_k_ap[int(k)].extend(ap_easy[mask_easy].tolist())
+
     # Aggregate globally across all sources
     results: Dict[str, float] = {}
     for k in ks:
@@ -418,15 +439,36 @@ def evaluate_box_record_recall(
         arr_h = np.array(per_k_scores_hard[int(k)], dtype=np.float32)
         results[f"record_recall@{int(k)}_easy"] = float(arr_e.mean()) if arr_e.size > 0 else 0.0
         results[f"record_recall@{int(k)}_hard"] = float(arr_h.mean()) if arr_h.size > 0 else 0.0
+        if include_map and per_k_ap is not None:
+            arr_ap = np.array(per_k_ap[int(k)], dtype=np.float32)
+            results[f"map@{int(k)}"] = float(arr_ap.mean()) if arr_ap.size > 0 else 0.0
 
     if params.verbose:
-        print(f"[eval-rr] Aggregated record-level recall: {results}")
+        summary_kind = "metrics" if include_map else "recall"
+        print(f"[eval-rr] Aggregated record-level {summary_kind}: {results}")
     return results
+
+
+def evaluate_box_record_recall(
+    params: EvalParams,
+    ks: Sequence[int],
+) -> Dict[str, float]:
+    """Compute record-level recall@K (easy and hard variants)."""
+    return _evaluate_box_metrics(params, ks, include_map=False)
+
+
+def evaluate_box_record_metrics(
+    params: EvalParams,
+    ks: Sequence[int],
+) -> Dict[str, float]:
+    """Compute record-level recall@K (easy, hard) and mean average precision@K."""
+    return _evaluate_box_metrics(params, ks, include_map=True)
 
 
 __all__ = [
     "EvalParams",
     "evaluate_box_record_recall",
+    "evaluate_box_record_metrics",
 ]
 
 
